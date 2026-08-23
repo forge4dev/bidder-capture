@@ -649,6 +649,7 @@ function summaryForRecord(record) {
     id: record.id,
     platform,
     email: fieldValue(fields, ["email", "email_address"]) || fieldValueByKeyIncludes(fields, "email"),
+    ip_address: fieldValue(fields, ["ip_address", "ip", "proxy_ip", "capture_ip"]),
     extension: fieldValue(fields, ["extension_version"]),
     extension_build_timestamp: fieldValue(fields, ["extension_build_timestamp"]),
     resume_cv: resumeValueFromFields(fields),
@@ -660,12 +661,9 @@ function summaryForRecord(record) {
 
 function extensionDisplay(summary) {
   const version = oneLine(summary.extension);
-  const buildTimestamp = oneLine(summary.extension_build_timestamp);
 
-  if (!version && !buildTimestamp) return "";
-  if (version && buildTimestamp) return `v${version} (${buildTimestamp})`;
   if (version) return `v${version}`;
-  return buildTimestamp;
+  return "";
 }
 
 function platformDisplay(platform) {
@@ -858,6 +856,7 @@ function renderDashboardTable(records, pagination = { offset: 0 }) {
   <td>${escapeHtml((pagination.offset || 0) + index + 1)}</td>
   <td>${platformDisplay(summary.platform)}</td>
   <td>${escapeHtml(summary.email)}</td>
+  <td>${escapeHtml(summary.ip_address)}</td>
   <td>${escapeHtml(extensionDisplay(summary))}</td>
   <td>${escapeHtml(summary.resume_cv)}</td>
   <td>${escapeHtml(summary.company_name)}</td>
@@ -865,7 +864,7 @@ function renderDashboardTable(records, pagination = { offset: 0 }) {
   <td>${escapeHtml(summary.bid_time)}</td>
 </tr>
 <tr id="${detailsId}" class="details-row" hidden>
-  <td colspan="9">${details}</td>
+  <td colspan="10">${details}</td>
 </tr>`;
   }).join("\n");
 
@@ -889,6 +888,7 @@ function renderDashboardTable(records, pagination = { offset: 0 }) {
         </span>
       </span></th>
       <th>Email</th>
+      <th>IP Address</th>
       <th>Extension</th>
       <th>Resume CV</th>
       <th>Company Name</th>

@@ -2,7 +2,7 @@
   "use strict";
 
   const MESSAGE_TYPE = "application-manual-fields-payload";
-  const EXTENSION_VERSION = "1.0.0";
+  const EXTENSION_VERSION = "1.0.1";
   const EXTENSION_BUILD_TIMESTAMP = "8/5, 6:00am PT";
   const GREENHOUSE_EMBED_URL = /^https:\/\/(?:boards|job-boards)\.greenhouse\.io\/embed(?:\/|\?|$)/;
   const LEVER_APPLY_URL = /^https:\/\/jobs\.lever\.co\/.*\/apply(?:[/?#].*)?$/;

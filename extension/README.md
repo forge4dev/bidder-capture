@@ -72,6 +72,19 @@ The options page shows:
 
 ## Capture result
 
+Each captured `manual_fields` object includes:
+
+```json
+{
+  "ip_address": "127.0.0.1"
+}
+```
+
+When Chrome proxy settings appear to be controlled/configured, the extension
+looks up the effective outbound IP address and stores that value instead. If
+proxy settings are disabled, not configured, or the lookup fails, it stores
+`127.0.0.1`.
+
 On successful upload, the application page shows a green toast:
 
 ```text

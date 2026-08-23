@@ -11,6 +11,11 @@ const ACTIVE_ICON_BACKGROUND = "#bfdbfe";
 const ACTIVE_ICON_TEXT = "#111827";
 const INACTIVE_ICON_BACKGROUND = "#6b7280";
 const INACTIVE_ICON_TEXT = "#ffffff";
+const DEFAULT_CAPTURE_IP_ADDRESS = "127.0.0.1";
+const IP_LOOKUP_URLS = [
+  "https://api.ipify.org?format=json",
+  "https://icanhazip.com/"
+];
 
 function normalizeServerUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
@@ -38,6 +43,100 @@ function downloadPayload(text) {
     conflictAction: "uniquify",
     saveAs: false
   });
+}
+
+function proxySettingsGet(details) {
+  return new Promise((resolve) => {
+    if (!chrome.proxy?.settings?.get) {
+      resolve(null);
+      return;
+    }
+
+    chrome.proxy.settings.get(details, (settings) => {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+      resolve(settings || null);
+    });
+  });
+}
+
+function proxyLooksConfigured(settings) {
+  if (!settings) return false;
+
+  const levelOfControl = String(settings.levelOfControl || "");
+  const value = settings.value || {};
+  const mode = String(value.mode || "").toLowerCase();
+
+  if (levelOfControl === "controlled_by_other_extensions") return true;
+  if (["fixed_servers", "pac_script", "auto_detect"].includes(mode)) return true;
+
+  return false;
+}
+
+function extractIpAddressFromText(text) {
+  const value = String(text || "").trim();
+  if (!value) return "";
+
+  try {
+    const parsed = JSON.parse(value);
+    const candidate = parsed.ip || parsed.query || parsed.address;
+    if (candidate) return String(candidate).trim();
+  } catch {
+    // Some endpoints return plain text.
+  }
+
+  const ipv4 = value.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+  if (ipv4) return ipv4[0];
+
+  const ipv6 = value.match(/\b(?:[a-f0-9]{0,4}:){2,}[a-f0-9]{0,4}\b/i);
+  return ipv6 ? ipv6[0] : "";
+}
+
+async function fetchEffectiveIpAddress() {
+  for (const url of IP_LOOKUP_URLS) {
+    try {
+      const response = await fetch(url, {
+        cache: "no-store",
+        credentials: "omit"
+      });
+      if (!response.ok) continue;
+
+      const ipAddress = extractIpAddressFromText(await response.text());
+      if (ipAddress) return ipAddress;
+    } catch {
+      // Try the next endpoint.
+    }
+  }
+
+  return "";
+}
+
+async function resolveApplicationIpAddress() {
+  const proxySettings = await proxySettingsGet({ incognito: false });
+  if (!proxyLooksConfigured(proxySettings)) {
+    return DEFAULT_CAPTURE_IP_ADDRESS;
+  }
+
+  return await fetchEffectiveIpAddress() || DEFAULT_CAPTURE_IP_ADDRESS;
+}
+
+async function enrichPayloadWithCaptureIp(payload) {
+  const enrichedPayload = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? { ...payload }
+    : {};
+
+  const manualFields = enrichedPayload.manual_fields &&
+    typeof enrichedPayload.manual_fields === "object" &&
+    !Array.isArray(enrichedPayload.manual_fields)
+    ? { ...enrichedPayload.manual_fields }
+    : {};
+
+  manualFields.ip_address = await resolveApplicationIpAddress();
+  enrichedPayload.manual_fields = manualFields;
+
+  return enrichedPayload;
 }
 
 async function postJson(url, body) {
@@ -240,7 +339,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id;
 
   if (message.downloadOnly) {
-    downloadPayload(message.text)
+    enrichPayloadWithCaptureIp(message.payload)
+      .then((payload) => downloadPayload(JSON.stringify(payload, null, 2)))
       .then(() => sendResponse({
         ok: true,
         uploaded: false,
@@ -258,17 +358,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  uploadCapture(message.payload)
-    .then(async () => {
-      const status = await storeCaptureStatus(tabId, true);
-      notifyTabCaptureStatus(tabId, status);
-      sendResponse({
-        ok: true,
-        uploaded: true,
-        downloaded: false,
-        message: status?.message || statusMessage(true)
-      });
-    })
+  enrichPayloadWithCaptureIp(message.payload)
+    .then((payload) => uploadCapture(payload)
+      .then(async () => {
+        const status = await storeCaptureStatus(tabId, true);
+        notifyTabCaptureStatus(tabId, status);
+        sendResponse({
+          ok: true,
+          uploaded: true,
+          downloaded: false,
+          message: status?.message || statusMessage(true)
+        });
+      })
+      .catch((error) => {
+        downloadPayload(JSON.stringify(payload, null, 2))
+          .then(async () => {
+            const status = await storeCaptureStatus(tabId, false);
+            notifyTabCaptureStatus(tabId, status);
+            sendResponse({
+              ok: false,
+              uploaded: false,
+              downloaded: true,
+              error: error.message,
+              message: status?.message || statusMessage(false)
+            });
+          })
+          .catch((downloadError) => {
+            storeCaptureStatus(tabId, false).then((status) => {
+              notifyTabCaptureStatus(tabId, status);
+              sendResponse({
+                ok: false,
+                uploaded: false,
+                downloaded: false,
+                error: `${error.message}; fallback download failed: ${downloadError.message}`,
+                message: status?.message || statusMessage(false)
+              });
+            }).catch(() => sendResponse({
+              ok: false,
+              uploaded: false,
+              downloaded: false,
+              error: `${error.message}; fallback download failed: ${downloadError.message}`,
+              message: statusMessage(false)
+            }));
+          });
+      }))
     .catch((error) => {
       downloadPayload(message.text)
         .then(async () => {
@@ -282,24 +415,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             message: status?.message || statusMessage(false)
           });
         })
-        .catch((downloadError) => {
-          storeCaptureStatus(tabId, false).then((status) => {
-            notifyTabCaptureStatus(tabId, status);
-            sendResponse({
-              ok: false,
-              uploaded: false,
-              downloaded: false,
-              error: `${error.message}; fallback download failed: ${downloadError.message}`,
-              message: status?.message || statusMessage(false)
-            });
-          }).catch(() => sendResponse({
-            ok: false,
-            uploaded: false,
-            downloaded: false,
-            error: `${error.message}; fallback download failed: ${downloadError.message}`,
-            message: statusMessage(false)
-          }));
-        });
+        .catch((downloadError) => sendResponse({
+          ok: false,
+          uploaded: false,
+          downloaded: false,
+          error: `${error.message}; fallback download failed: ${downloadError.message}`,
+          message: statusMessage(false)
+        }));
     });
 
   return true;

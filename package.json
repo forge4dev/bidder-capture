@@ -1,6 +1,6 @@
 {
   "name": "bidder-capture",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Chrome extension and local dashboard server for application manual field capture.",
   "scripts": {
