@@ -1,0 +1,35 @@
+node_modules/
+
+# Local agent/workspace metadata
+.agents/
+**/.git.invalid-*/
+
+# Local dashboard data/logs
+server/data/
+server/logs/
+*.sqlite
+*.sqlite-*
+
+# Local secrets / environment files
+.env
+.env.*
+
+# Local test artifacts and personal files
+*.doc
+*.docx
+*.pdf
+*.rar
+api.txt
+todo.txt
+__pycache__/
+
+# Demo/archive folders not needed for Render deployment
+greenhouse_video/
+extensin_jobright_mark_applied/
+
+# Sample captured payloads
+extension/payload.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

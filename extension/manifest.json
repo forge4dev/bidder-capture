@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "Application Manual Fields Capture",
+  "version": "1.0.0",
+  "description": "Captures manually filled application fields and sends them to the configured dashboard server.",
+  "permissions": ["downloads", "storage", "webNavigation"],
+  "host_permissions": ["https://*/*", "http://*/*"],
+  "options_page": "options.html",
+  "action": {
+    "default_title": "Application Manual Fields Capture",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://boards.greenhouse.io/*",
+        "https://job-boards.greenhouse.io/*",
+        "https://jobs.lever.co/*",
+        "https://jobs.jobvite.com/*",
+        "https://jobs.ashbyhq.com/*",
+        "https://ats.rippling.com/*",
+        "https://*.recruitee.com/*",
+        "https://*.bamboohr.com/*",
+        "https://*.gusto.com/*",
+        "https://*.gusto.io/*",
+        "https://applytojob.com/*",
+        "https://*.applytojob.com/*",
+        "https://*.myworkdayjobs.com/*"
+      ],
+      "js": ["page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://boards.greenhouse.io/*",
+        "https://job-boards.greenhouse.io/*",
+        "https://jobs.lever.co/*",
+        "https://jobs.jobvite.com/*",
+        "https://jobs.ashbyhq.com/*",
+        "https://ats.rippling.com/*",
+        "https://*.recruitee.com/*",
+        "https://*.bamboohr.com/*",
+        "https://*.gusto.com/*",
+        "https://*.gusto.io/*",
+        "https://applytojob.com/*",
+        "https://*.applytojob.com/*",
+        "https://*.myworkdayjobs.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}

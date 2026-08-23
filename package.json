@@ -1,0 +1,18 @@
+{
+  "name": "bidder-capture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension and local dashboard server for application manual field capture.",
+  "scripts": {
+    "start": "node server/index.js",
+    "server": "node server/index.js",
+    "check": "node --check server/index.js && node --check extension/background.js && node --check extension/content.js && node --check extension/options.js && node --check extension/page-hook.js && node --check extension/popup.js"
+  },
+  "dependencies": {
+    "express": "^4.18.3",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.45.0"
+  }
+}

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Application Capture Options</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 32px; color: #171721; max-width: 620px; }
+    h1 { margin-bottom: 8px; }
+    .hint { color: #5b5b68; margin-bottom: 24px; }
+    label { display: block; margin: 16px 0 6px; font-weight: 700; }
+    input { box-sizing: border-box; width: 100%; border: 1px solid #c8c8dd; border-radius: 8px; padding: 10px 12px; font-size: 15px; }
+    button { margin-top: 18px; border: 1px solid #c8c8dd; border-radius: 8px; background: #171721; color: white; padding: 10px 14px; cursor: pointer; }
+    #status { min-height: 22px; margin: 18px 0 0; font-weight: 700; }
+    #status.success { color: #067647; }
+    #status.failure { color: #b42318; }
+  </style>
+</head>
+<body>
+  <h1>Dashboard Connection</h1>
+  <div class="hint">Configure the bidder-side connection values from the master's Setting page. BIDDER_PASSWORD can be blank if the master has not configured one.</div>
+
+  <label for="serverUrl">Dashboard Server URL</label>
+  <input id="serverUrl" type="url" placeholder="https://dashboard.example.com">
+
+  <label for="masterUserId">Master User ID</label>
+  <input id="masterUserId" type="text" placeholder="admin">
+
+  <label for="bidderPassword">BIDDER_PASSWORD</label>
+  <input id="bidderPassword" type="password">
+
+  <div id="status" aria-live="polite"></div>
+  <button id="save" type="button">Save</button>
+  <button id="test" type="button">Test Connection</button>
+
+  <script src="options.js"></script>
+</body>
+</html>
