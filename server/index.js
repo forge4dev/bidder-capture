@@ -17,6 +17,16 @@ const SERVER_TIME_ZONE = process.env.SERVER_TIME_ZONE || "America/Los_Angeles";
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-session-secret-change-me";
 const DEFAULT_ADMIN_ID = "admin";
 const DEFAULT_ADMIN_PASSWORD = "123456";
+const DASHBOARD_RELEASE = Object.freeze({
+  version: "1.1.0",
+  releasedAt: "September 27, 2026",
+  summary: "Add notes, flag records for review, filter flagged records, and prevent duplicate captures.",
+  features: [
+    { title: "Notes", description: "Add and edit a note for every bidder record." },
+    { title: "Flags", description: "Flag important records and use Flagged only to review them later." },
+    { title: "Duplicate prevention", description: "Repeated captures of the same application now update the existing record instead of creating duplicates." }
+  ]
+});
 
 let db;
 let dbKind = "sqlite";
@@ -1208,12 +1218,51 @@ function renderDashboardTablePanel(records, pagination) {
   ${renderPaginationControls(pagination)}`;
 }
 
+function renderReleaseBanner() {
+  return `<section id="release-banner" class="release-banner" data-release-version="${escapeHtml(DASHBOARD_RELEASE.version)}" aria-labelledby="release-banner-title" hidden>
+    <div class="release-banner-icon" aria-hidden="true">&#10024;</div>
+    <div class="release-banner-copy">
+      <strong id="release-banner-title">New in Dashboard v${escapeHtml(DASHBOARD_RELEASE.version)}</strong>
+      <span>${escapeHtml(DASHBOARD_RELEASE.summary)}</span>
+    </div>
+    <div class="release-banner-actions">
+      <button type="button" data-open-release>View details</button>
+      <button type="button" data-dismiss-release>Dismiss</button>
+    </div>
+  </section>`;
+}
+
+function renderReleaseDialog() {
+  return `<dialog id="release-dialog" class="release-dialog" aria-labelledby="release-dialog-title">
+    <div class="release-dialog-content">
+      <div class="release-dialog-heading">
+        <div>
+          <div class="release-eyebrow">Dashboard update</div>
+          <h2 id="release-dialog-title">What’s new in v${escapeHtml(DASHBOARD_RELEASE.version)}</h2>
+          <p>Released ${escapeHtml(DASHBOARD_RELEASE.releasedAt)}</p>
+        </div>
+        <button class="release-dialog-close" type="button" data-close-release aria-label="Close What’s New dialog">&times;</button>
+      </div>
+      <div class="release-feature-list">
+        ${DASHBOARD_RELEASE.features.map((feature) => `<article class="release-feature">
+          <h3>${escapeHtml(feature.title)}</h3>
+          <p>${escapeHtml(feature.description)}</p>
+        </article>`).join("")}
+      </div>
+      <div class="release-dialog-actions">
+        <button type="button" data-close-release>Close</button>
+      </div>
+    </div>
+  </dialog>`;
+}
+
 function layout({ title, master, active = "", body }) {
   const nav = master ? `<nav>
     <div class="nav-tabs">
         <a class="${active === "dashboard" ? "active" : ""}" href="/dashboard">Dashboard</a>
         ${active === "dashboard" ? `<button class="refresh-button" type="button" data-refresh-table-url="/dashboard/table" aria-label="Refresh bidding logs" title="Refresh bidding logs"><span aria-hidden="true">↻</span></button>` : ""}
       <a class="${active === "settings" ? "active" : ""}" href="/settings">Setting</a>
+      <button id="whats-new-button" class="whats-new-button" type="button">What’s New <span id="release-new-badge" class="release-new-badge" hidden>New</span></button>
     </div>
     <form method="post" action="/signout"><button type="submit">Sign out</button></form>
   </nav>` : "";
@@ -1248,6 +1297,30 @@ function layout({ title, master, active = "", body }) {
       line-height: 1;
     }
     nav .refresh-button { display: none; }
+    .whats-new-button { display: inline-flex; align-items: center; gap: 7px; }
+    .release-new-badge { border-radius: 999px; background: #dc2626; color: #fff; padding: 2px 6px; font-size: 10px; font-weight: 800; line-height: 1.2; text-transform: uppercase; letter-spacing: 0.04em; }
+    .release-banner[hidden], .release-new-badge[hidden] { display: none !important; }
+    .release-banner { display: flex; gap: 14px; align-items: center; margin: 0 0 18px; border: 1px solid #c7d2fe; border-radius: 12px; background: linear-gradient(135deg, #eef2ff, #faf5ff); padding: 14px 16px; box-shadow: 0 8px 22px rgba(79,70,229,0.08); }
+    .release-banner-icon { flex: 0 0 auto; font-size: 24px; }
+    .release-banner-copy { display: flex; flex: 1 1 auto; flex-direction: column; gap: 4px; min-width: 200px; }
+    .release-banner-copy strong { color: #312e81; font-size: 15px; }
+    .release-banner-copy span { color: #4b5563; font-size: 13px; line-height: 1.4; }
+    .release-banner-actions { display: flex; flex: 0 0 auto; gap: 8px; }
+    .release-banner-actions button, .release-dialog-actions button { border: 1px solid #a5b4fc; border-radius: 8px; background: #fff; color: #312e81; padding: 8px 11px; font-weight: 700; cursor: pointer; }
+    .release-banner-actions button:first-child { border-color: #4338ca; background: #4338ca; color: #fff; }
+    .release-dialog { width: min(620px, calc(100vw - 40px)); border: 0; border-radius: 14px; padding: 0; box-shadow: 0 24px 60px rgba(0,0,0,0.3); }
+    .release-dialog::backdrop { background: rgba(17,24,39,0.52); }
+    .release-dialog-content { padding: 24px; }
+    .release-dialog-heading { display: flex; justify-content: space-between; gap: 18px; border-bottom: 1px solid #e5e7eb; padding-bottom: 16px; }
+    .release-dialog-heading h2 { margin: 3px 0 5px; font-size: 24px; }
+    .release-dialog-heading p { margin: 0; color: #6b7280; font-size: 13px; }
+    .release-eyebrow { color: #4338ca; font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; }
+    .release-dialog-close { align-self: flex-start; width: 34px; height: 34px; border: 1px solid #d1d5db; border-radius: 999px; background: #fff; color: #4b5563; font-size: 22px; line-height: 1; cursor: pointer; }
+    .release-feature-list { display: grid; gap: 10px; margin: 18px 0; }
+    .release-feature { border: 1px solid #e5e7eb; border-radius: 10px; background: #fafafa; padding: 13px 14px; }
+    .release-feature h3 { margin: 0 0 5px; font-size: 15px; }
+    .release-feature p { margin: 0; color: #4b5563; font-size: 13px; line-height: 1.45; }
+    .release-dialog-actions { display: flex; justify-content: flex-end; }
     .dashboard-table-toolbar { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; margin: 0 0 10px; }
     .dashboard-table-tools { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
     .record-filter { display: inline-flex; padding: 3px; border: 1px solid #c8c8dd; border-radius: 9px; background: #fff; }
@@ -1351,13 +1424,58 @@ function layout({ title, master, active = "", body }) {
     .review-value { color: #111827; white-space: normal; overflow-wrap: anywhere; }
     .review-value div + div { margin-top: 2px; }
     code { background: #f0f0fa; border-radius: 6px; padding: 3px 6px; }
+    @media (max-width: 700px) {
+      body { margin: 18px; }
+      nav, .nav-tabs, .release-banner { align-items: stretch; flex-wrap: wrap; }
+      nav form { margin-left: 0; }
+      .release-banner-actions { width: 100%; }
+      .release-banner-actions button { flex: 1 1 0; }
+    }
   </style>
 </head>
 <body>
   ${nav}
   ${body}
+  ${master ? renderReleaseDialog() : ""}
   <script>
+    const dashboardReleaseVersion = ${JSON.stringify(DASHBOARD_RELEASE.version)};
+    const releaseStorageKey = "bidder-dashboard-seen-release";
+    const releaseBanner = document.getElementById("release-banner");
+    const releaseBadge = document.getElementById("release-new-badge");
+    let releaseSeen = false;
+    try {
+      releaseSeen = window.localStorage.getItem(releaseStorageKey) === dashboardReleaseVersion;
+    } catch {
+      releaseSeen = false;
+    }
+    if (releaseBanner) releaseBanner.hidden = releaseSeen;
+    if (releaseBadge) releaseBadge.hidden = releaseSeen;
+
     document.addEventListener("click", (event) => {
+      const openReleaseButton = event.target.closest("#whats-new-button, [data-open-release]");
+      if (openReleaseButton) {
+        document.getElementById("release-dialog")?.showModal();
+        return;
+      }
+
+      const closeReleaseButton = event.target.closest("[data-close-release]");
+      if (closeReleaseButton) {
+        document.getElementById("release-dialog")?.close();
+        return;
+      }
+
+      const dismissReleaseButton = event.target.closest("[data-dismiss-release]");
+      if (dismissReleaseButton) {
+        try {
+          window.localStorage.setItem(releaseStorageKey, dashboardReleaseVersion);
+        } catch {
+          // The banner still dismisses for this page when browser storage is unavailable.
+        }
+        if (releaseBanner) releaseBanner.hidden = true;
+        if (releaseBadge) releaseBadge.hidden = true;
+        return;
+      }
+
       const flagButton = event.target.closest(".flag-toggle-button");
       if (flagButton) {
         const recordId = flagButton.dataset.recordId || "";
@@ -1563,7 +1681,8 @@ function renderDashboardPage({ master = null, records, pagination }) {
     title: "Dashboard",
     master,
     active: "dashboard",
-    body: `<div id="dashboard-action-error" class="error dashboard-action-error" role="alert"></div>
+    body: `${renderReleaseBanner()}
+      <div id="dashboard-action-error" class="error dashboard-action-error" role="alert"></div>
       <div id="dashboard-table-container">${renderDashboardTablePanel(records, pagination)}</div>
       <dialog id="note-dialog" class="note-dialog">
         <form id="note-form" class="note-form">
