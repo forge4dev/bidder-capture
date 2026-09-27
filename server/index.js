@@ -11,7 +11,7 @@ const scrypt = promisify(crypto.scrypt);
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.join(__dirname, "data");
-const DB_FILE = path.join(DATA_DIR, "bidder-dashboard.sqlite");
+const DB_FILE = process.env.SQLITE_DB_FILE || path.join(DATA_DIR, "bidder-dashboard.sqlite");
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const SERVER_TIME_ZONE = process.env.SERVER_TIME_ZONE || "America/Los_Angeles";
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-session-secret-change-me";
@@ -49,6 +49,45 @@ function formatLogEntry(id, manualFields, createdAt) {
     .filter(([key, value]) => key && value)
     .map(([key, value]) => `${key}: ${value}`);
   return `(${parts.join(", ")})`;
+}
+
+function canonicalApplicationUrl(value) {
+  const rawUrl = oneLine(value);
+  if (!rawUrl) return "";
+
+  try {
+    const parsedUrl = new URL(rawUrl);
+    parsedUrl.hash = "";
+    for (const key of [...parsedUrl.searchParams.keys()]) {
+      if (/^utm_/i.test(key) || ["source", "ref", "referrer"].includes(key.toLowerCase())) {
+        parsedUrl.searchParams.delete(key);
+      }
+    }
+    parsedUrl.searchParams.sort();
+    return parsedUrl.toString().replace(/\/$/, "");
+  } catch {
+    return rawUrl;
+  }
+}
+
+function biddingLogDedupeKey(manualFields) {
+  const fields = manualFields && typeof manualFields === "object" ? manualFields : {};
+  const platform = fieldValue(fields, ["platform"]).toLowerCase();
+  const email = (fieldValue(fields, ["email", "email_address"]) || fieldValueByKeyIncludes(fields, "email")).toLowerCase();
+  const fullName = fieldValue(fields, ["full_name", "name"]).toLowerCase();
+  const firstName = fieldValue(fields, ["first_name", "firstname"]).toLowerCase();
+  const lastName = fieldValue(fields, ["last_name", "lastname"]).toLowerCase();
+  const applicantIdentity = email || fullName || [firstName, lastName].filter(Boolean).join("|");
+  const bidUrl = canonicalApplicationUrl(fieldValue(fields, ["bid_url"]));
+  const company = fieldValue(fields, ["company_name", "company"]).toLowerCase();
+  const jobTitle = fieldValue(fields, ["job_title", "title", "position"]).toLowerCase();
+  const jobIdentity = bidUrl || [company, jobTitle].filter(Boolean).join("|");
+
+  if (!applicantIdentity || !jobIdentity) return null;
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify([platform, applicantIdentity, jobIdentity]))
+    .digest("hex");
 }
 
 function generateMasterId() {
@@ -137,8 +176,12 @@ async function initDatabase() {
     dbKind = "postgres";
     db = new Pool({
       connectionString: DATABASE_URL,
-      ssl: shouldUsePostgresSsl(DATABASE_URL) ? { rejectUnauthorized: false } : false
+      ssl: shouldUsePostgresSsl(DATABASE_URL) ? { rejectUnauthorized: false } : false,
+      connectionTimeoutMillis: 10000,
+      query_timeout: 30000,
+      statement_timeout: 30000
     });
+    console.log("Database startup: connecting and ensuring tables...");
     await db.query(`
       CREATE TABLE IF NOT EXISTS masters (
         id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -154,9 +197,36 @@ async function initDatabase() {
         master_id TEXT NOT NULL REFERENCES masters(master_id),
         created_at TEXT NOT NULL,
         manual_fields_json TEXT NOT NULL,
-        raw_text TEXT NOT NULL
+        raw_text TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        dedupe_key TEXT,
+        flagged_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        migration_name TEXT PRIMARY KEY,
+        completed_at TEXT NOT NULL
       );
     `);
+    console.log("Database startup: ensuring new columns...");
+    await db.query(`
+      ALTER TABLE bidding_logs
+      ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
+      ALTER TABLE bidding_logs
+      ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+      ALTER TABLE bidding_logs
+      ADD COLUMN IF NOT EXISTS flagged_at TEXT;
+    `);
+    console.log("Database startup: ensuring indexes...");
+    await db.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS bidding_logs_master_dedupe_key
+      ON bidding_logs (master_id, dedupe_key)
+    `);
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS bidding_logs_master_flagged_at
+      ON bidding_logs (master_id, flagged_at)
+    `);
+    console.log("Database startup: schema ready.");
     return;
   }
 
@@ -180,9 +250,184 @@ async function initDatabase() {
       created_at TEXT NOT NULL,
       manual_fields_json TEXT NOT NULL,
       raw_text TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+      dedupe_key TEXT,
+      flagged_at TEXT,
       FOREIGN KEY(master_id) REFERENCES masters(master_id)
     );
+
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      migration_name TEXT PRIMARY KEY,
+      completed_at TEXT NOT NULL
+    );
   `);
+
+  const biddingLogColumns = db.prepare("PRAGMA table_info(bidding_logs)").all();
+  if (!biddingLogColumns.some((column) => column.name === "note")) {
+    db.exec("ALTER TABLE bidding_logs ADD COLUMN note TEXT NOT NULL DEFAULT ''");
+  }
+  if (!biddingLogColumns.some((column) => column.name === "dedupe_key")) {
+    db.exec("ALTER TABLE bidding_logs ADD COLUMN dedupe_key TEXT");
+  }
+  if (!biddingLogColumns.some((column) => column.name === "flagged_at")) {
+    db.exec("ALTER TABLE bidding_logs ADD COLUMN flagged_at TEXT");
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS bidding_logs_master_dedupe_key
+    ON bidding_logs (master_id, dedupe_key)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS bidding_logs_master_flagged_at
+    ON bidding_logs (master_id, flagged_at)
+  `);
+}
+
+async function migrateBiddingLogDedupeKeys({ batchSize = 500 } = {}) {
+  const migrationName = "2026-09-bidding-log-dedupe-v1";
+  const existingMigration = await dbGet(
+    "SELECT migration_name FROM schema_migrations WHERE migration_name = ?",
+    "SELECT migration_name FROM schema_migrations WHERE migration_name = $1",
+    [migrationName]
+  );
+  if (existingMigration) {
+    console.log(`Migration already completed: ${migrationName}`);
+    return;
+  }
+
+  console.log(`Migration starting: ${migrationName}`);
+  const groups = new Map();
+  const duplicateIds = [];
+  let offset = 0;
+  let scanned = 0;
+
+  while (true) {
+    const rows = await dbAll(
+      `
+        SELECT id, master_id, created_at, manual_fields_json, note
+        FROM bidding_logs
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+      `,
+      `
+        SELECT id, master_id, created_at, manual_fields_json, note
+        FROM bidding_logs
+        ORDER BY created_at DESC, id DESC
+        LIMIT $1 OFFSET $2
+      `,
+      [batchSize, offset]
+    );
+    if (!rows.length) break;
+
+    for (const row of rows) {
+      let manualFields = {};
+      try {
+        manualFields = JSON.parse(row.manual_fields_json);
+      } catch {
+        continue;
+      }
+      const dedupeKey = biddingLogDedupeKey(manualFields);
+      if (!dedupeKey) continue;
+      const groupKey = `${row.master_id}:${dedupeKey}`;
+      const group = groups.get(groupKey);
+      if (!group) {
+        groups.set(groupKey, {
+          id: Number(row.id),
+          dedupeKey,
+          preservedNote: row.note || ""
+        });
+      } else {
+        duplicateIds.push(Number(row.id));
+        if (!oneLine(group.preservedNote) && oneLine(row.note)) {
+          group.preservedNote = row.note;
+        }
+      }
+    }
+
+    scanned += rows.length;
+    offset += rows.length;
+    console.log(`Migration scan: ${scanned} records`);
+    if (rows.length < batchSize) break;
+  }
+
+  const keepers = [...groups.values()];
+  if (dbKind === "postgres") {
+    await applyPostgresDedupeMigration({ duplicateIds, keepers, batchSize, migrationName });
+  } else {
+    applySqliteDedupeMigration({ duplicateIds, keepers, batchSize, migrationName });
+  }
+  console.log(`Migration complete: scanned ${scanned}, removed ${duplicateIds.length}, retained ${keepers.length}`);
+}
+
+function chunks(values, size) {
+  const result = [];
+  for (let index = 0; index < values.length; index += size) {
+    result.push(values.slice(index, index + size));
+  }
+  return result;
+}
+
+async function applyPostgresDedupeMigration({ duplicateIds, keepers, batchSize, migrationName }) {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    for (const idBatch of chunks(duplicateIds, batchSize)) {
+      await client.query("DELETE FROM bidding_logs WHERE id = ANY($1::integer[])", [idBatch]);
+    }
+    for (const keeperBatch of chunks(keepers, Math.min(batchSize, 500))) {
+      const params = [];
+      const values = keeperBatch.map((keeper, index) => {
+        const base = index * 3;
+        params.push(keeper.id, keeper.dedupeKey, keeper.preservedNote || "");
+        return `($${base + 1}::integer, $${base + 2}::text, $${base + 3}::text)`;
+      });
+      await client.query(`
+        UPDATE bidding_logs AS bidding_log
+        SET
+          dedupe_key = migration.dedupe_key,
+          note = CASE
+            WHEN bidding_log.note = '' AND migration.preserved_note <> '' THEN migration.preserved_note
+            ELSE bidding_log.note
+          END
+        FROM (VALUES ${values.join(",")}) AS migration(id, dedupe_key, preserved_note)
+        WHERE bidding_log.id = migration.id
+      `, params);
+    }
+    await client.query(
+      "INSERT INTO schema_migrations (migration_name, completed_at) VALUES ($1, $2) ON CONFLICT (migration_name) DO NOTHING",
+      [migrationName, new Date().toISOString()]
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function applySqliteDedupeMigration({ duplicateIds, keepers, batchSize, migrationName }) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const idBatch of chunks(duplicateIds, batchSize)) {
+      const placeholders = idBatch.map(() => "?").join(",");
+      db.prepare(`DELETE FROM bidding_logs WHERE id IN (${placeholders})`).run(...idBatch);
+    }
+    const update = db.prepare(`
+      UPDATE bidding_logs
+      SET dedupe_key = ?, note = CASE WHEN note = '' AND ? <> '' THEN ? ELSE note END
+      WHERE id = ?
+    `);
+    for (const keeper of keepers) {
+      const preservedNote = keeper.preservedNote || "";
+      update.run(keeper.dedupeKey, preservedNote, preservedNote, keeper.id);
+    }
+    db.prepare("INSERT OR IGNORE INTO schema_migrations (migration_name, completed_at) VALUES (?, ?)")
+      .run(migrationName, new Date().toISOString());
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 async function dbGet(sqliteSql, postgresSql, params = []) {
@@ -296,24 +541,34 @@ async function verifyBidderCredentials(masterUserId, bidderPassword) {
 async function insertBiddingLog(masterId, manualFields) {
   const createdAt = new Date().toISOString();
   const rawText = formatLogEntry(null, manualFields, createdAt);
+  const dedupeKey = biddingLogDedupeKey(manualFields);
   let id;
 
   if (dbKind === "postgres") {
     const result = await db.query(
       `
-        INSERT INTO bidding_logs (master_id, created_at, manual_fields_json, raw_text)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO bidding_logs (master_id, created_at, manual_fields_json, raw_text, dedupe_key)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (master_id, dedupe_key) DO UPDATE SET
+          created_at = EXCLUDED.created_at,
+          manual_fields_json = EXCLUDED.manual_fields_json,
+          raw_text = EXCLUDED.raw_text
         RETURNING id
       `,
-      [masterId, createdAt, JSON.stringify(manualFields), rawText]
+      [masterId, createdAt, JSON.stringify(manualFields), rawText, dedupeKey]
     );
     id = Number(result.rows[0].id);
   } else {
     const result = db.prepare(`
-      INSERT INTO bidding_logs (master_id, created_at, manual_fields_json, raw_text)
-      VALUES (?, ?, ?, ?)
-    `).run(masterId, createdAt, JSON.stringify(manualFields), rawText);
-    id = Number(result.lastInsertRowid);
+      INSERT INTO bidding_logs (master_id, created_at, manual_fields_json, raw_text, dedupe_key)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (master_id, dedupe_key) DO UPDATE SET
+        created_at = excluded.created_at,
+        manual_fields_json = excluded.manual_fields_json,
+        raw_text = excluded.raw_text
+      RETURNING id
+    `).get(masterId, createdAt, JSON.stringify(manualFields), rawText, dedupeKey);
+    id = Number(result.id);
   }
 
   const finalRawText = formatLogEntry(id, manualFields, createdAt);
@@ -328,13 +583,13 @@ async function insertBiddingLog(masterId, manualFields) {
 async function logsForMaster(masterId) {
   const rows = await dbAll(
     `
-      SELECT id, created_at, manual_fields_json, raw_text
+      SELECT id, created_at, manual_fields_json, raw_text, note, flagged_at
       FROM bidding_logs
       WHERE master_id = ?
       ORDER BY id DESC
     `,
     `
-      SELECT id, created_at, manual_fields_json, raw_text
+      SELECT id, created_at, manual_fields_json, raw_text, note, flagged_at
       FROM bidding_logs
       WHERE master_id = $1
       ORDER BY id DESC
@@ -353,7 +608,9 @@ async function logsForMaster(masterId) {
       id: row.id,
       created_at: row.created_at,
       manual_fields: manualFields,
-      raw_entry: row.raw_text
+      raw_entry: row.raw_text,
+      note: row.note || "",
+      flagged_at: row.flagged_at || null
     };
   });
 }
@@ -364,20 +621,22 @@ function paginationFromQuery(query = {}) {
   const pageSize = allowedPageSizes.includes(requestedPageSize) ? requestedPageSize : 10;
   const requestedPage = Number(query.page || 1);
   const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
-  return { page, pageSize };
+  const filter = query.filter === "flagged" ? "flagged" : "all";
+  return { page, pageSize, filter };
 }
 
-async function logsPageForMaster(masterId, { page = 1, pageSize = 10 } = {}) {
+async function logsPageForMaster(masterId, { page = 1, pageSize = 10, filter = "all" } = {}) {
+  const flaggedWhere = filter === "flagged" ? " AND flagged_at IS NOT NULL" : "";
   const countRow = await dbGet(
     `
       SELECT COUNT(*) AS count
       FROM bidding_logs
-      WHERE master_id = ?
+      WHERE master_id = ?${flaggedWhere}
     `,
     `
       SELECT COUNT(*) AS count
       FROM bidding_logs
-      WHERE master_id = $1
+      WHERE master_id = $1${flaggedWhere}
     `,
     [masterId]
   );
@@ -388,16 +647,16 @@ async function logsPageForMaster(masterId, { page = 1, pageSize = 10 } = {}) {
 
   const rows = await dbAll(
     `
-      SELECT id, created_at, manual_fields_json, raw_text
+      SELECT id, created_at, manual_fields_json, raw_text, note, flagged_at
       FROM bidding_logs
-      WHERE master_id = ?
+      WHERE master_id = ?${flaggedWhere}
       ORDER BY id DESC
       LIMIT ? OFFSET ?
     `,
     `
-      SELECT id, created_at, manual_fields_json, raw_text
+      SELECT id, created_at, manual_fields_json, raw_text, note, flagged_at
       FROM bidding_logs
-      WHERE master_id = $1
+      WHERE master_id = $1${flaggedWhere}
       ORDER BY id DESC
       LIMIT $2 OFFSET $3
     `,
@@ -415,7 +674,9 @@ async function logsPageForMaster(masterId, { page = 1, pageSize = 10 } = {}) {
       id: row.id,
       created_at: row.created_at,
       manual_fields: manualFields,
-      raw_entry: row.raw_text
+      raw_entry: row.raw_text,
+      note: row.note || "",
+      flagged_at: row.flagged_at || null
     };
   });
 
@@ -426,7 +687,8 @@ async function logsPageForMaster(masterId, { page = 1, pageSize = 10 } = {}) {
       pageSize,
       totalItems,
       totalPages,
-      offset
+      offset,
+      filter
     }
   };
 }
@@ -434,12 +696,12 @@ async function logsPageForMaster(masterId, { page = 1, pageSize = 10 } = {}) {
 async function allLogs() {
   const rows = await dbAll(
     `
-      SELECT id, created_at, manual_fields_json, raw_text
+      SELECT id, created_at, manual_fields_json, raw_text, note, flagged_at
       FROM bidding_logs
       ORDER BY id DESC
     `,
     `
-      SELECT id, created_at, manual_fields_json, raw_text
+      SELECT id, created_at, manual_fields_json, raw_text, note, flagged_at
       FROM bidding_logs
       ORDER BY id DESC
     `
@@ -456,9 +718,31 @@ async function allLogs() {
       id: row.id,
       created_at: row.created_at,
       manual_fields: manualFields,
-      raw_entry: row.raw_text
+      raw_entry: row.raw_text,
+      note: row.note || "",
+      flagged_at: row.flagged_at || null
     };
   });
+}
+
+async function updateBiddingLogNote(masterId, recordId, note) {
+  const result = await dbRun(
+    "UPDATE bidding_logs SET note = ? WHERE id = ? AND master_id = ?",
+    "UPDATE bidding_logs SET note = $1 WHERE id = $2 AND master_id = $3",
+    [note, recordId, masterId]
+  );
+  return dbKind === "postgres" ? result.rowCount > 0 : result.changes > 0;
+}
+
+async function updateBiddingLogFlag(masterId, recordId, flagged) {
+  const flaggedAt = flagged ? new Date().toISOString() : null;
+  const result = await dbRun(
+    "UPDATE bidding_logs SET flagged_at = ? WHERE id = ? AND master_id = ?",
+    "UPDATE bidding_logs SET flagged_at = $1 WHERE id = $2 AND master_id = $3",
+    [flaggedAt, recordId, masterId]
+  );
+  const updated = dbKind === "postgres" ? result.rowCount > 0 : result.changes > 0;
+  return { updated, flaggedAt };
 }
 
 function fieldValue(fields, candidates) {
@@ -805,12 +1089,12 @@ function renderRecordDetails(record) {
   return renderManualFieldsDetails(manualFields);
 }
 
-function pageUrl(page, pageSize) {
-  return `/dashboard?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`;
+function pageUrl(page, pageSize, filter = "all") {
+  return `/dashboard?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&filter=${encodeURIComponent(filter)}`;
 }
 
-function tableUrl(page, pageSize) {
-  return `/dashboard/table?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`;
+function tableUrl(page, pageSize, filter = "all") {
+  return `/dashboard/table?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&filter=${encodeURIComponent(filter)}`;
 }
 
 function renderPaginationControls(pagination) {
@@ -818,6 +1102,7 @@ function renderPaginationControls(pagination) {
   const pageSize = pagination?.pageSize || 10;
   const totalItems = pagination?.totalItems || 0;
   const totalPages = pagination?.totalPages || 1;
+  const filter = pagination?.filter === "flagged" ? "flagged" : "all";
   const itemStart = totalItems ? (pagination.offset || 0) + 1 : 0;
   const itemEnd = Math.min((pagination.offset || 0) + pageSize, totalItems);
   const pageSizes = [10, 50, 100];
@@ -829,16 +1114,18 @@ function renderPaginationControls(pagination) {
         ${pageSizes.map((size) => `<option value="${size}"${size === pageSize ? " selected" : ""}>${size}</option>`).join("")}
       </select>
       <input type="hidden" name="page" value="1">
+      <input type="hidden" name="filter" value="${escapeHtml(filter)}">
     </form>
     <div class="page-number">
       <span>Page number</span>
-      <a class="page-link${page <= 1 ? " disabled" : ""}" href="${escapeHtml(pageUrl(Math.max(1, page - 1), pageSize))}" aria-label="Previous page">&lsaquo;</a>
+      <a class="page-link${page <= 1 ? " disabled" : ""}" href="${escapeHtml(pageUrl(Math.max(1, page - 1), pageSize, filter))}" aria-label="Previous page">&lsaquo;</a>
       <form class="page-number-form" method="get" action="/dashboard">
         <input type="number" name="page" min="1" max="${escapeHtml(totalPages)}" value="${escapeHtml(page)}" aria-label="Page number">
         <input type="hidden" name="page_size" value="${escapeHtml(pageSize)}">
+        <input type="hidden" name="filter" value="${escapeHtml(filter)}">
       </form>
       <span>of ${escapeHtml(totalPages)}</span>
-      <a class="page-link${page >= totalPages ? " disabled" : ""}" href="${escapeHtml(pageUrl(Math.min(totalPages, page + 1), pageSize))}" aria-label="Next page">&rsaquo;</a>
+      <a class="page-link${page >= totalPages ? " disabled" : ""}" href="${escapeHtml(pageUrl(Math.min(totalPages, page + 1), pageSize, filter))}" aria-label="Next page">&rsaquo;</a>
     </div>
     <div class="page-summary">${escapeHtml(itemStart)}-${escapeHtml(itemEnd)} of ${escapeHtml(totalItems)}</div>
   </div>`;
@@ -861,10 +1148,12 @@ function renderDashboardTable(records, pagination = { offset: 0 }) {
   <td>${escapeHtml(summary.resume_cv)}</td>
   <td>${escapeHtml(summary.company_name)}</td>
   <td>${escapeHtml(summary.job_title)}</td>
+  <td><button class="flag-toggle-button${record.flagged_at ? " is-flagged" : ""}" type="button" data-record-id="${escapeHtml(record.id)}" aria-pressed="${record.flagged_at ? "true" : "false"}" aria-label="${record.flagged_at ? "Remove review flag" : "Flag for review"}" title="${record.flagged_at ? "Remove review flag" : "Flag for review"}"><span aria-hidden="true">&#9873;</span></button></td>
+  <td><button class="note-edit-button${record.note ? " has-note" : ""}" type="button" data-record-id="${escapeHtml(record.id)}" data-note="${escapeHtml(record.note || "")}" aria-label="Edit note for record ${escapeHtml(record.id)}" title="${record.note ? "Edit note (note saved)" : "Add note"}"><span aria-hidden="true">&#9998;</span></button></td>
   <td>${escapeHtml(summary.bid_time)}</td>
 </tr>
 <tr id="${detailsId}" class="details-row" hidden>
-  <td colspan="10">${details}</td>
+  <td colspan="12">${details}</td>
 </tr>`;
   }).join("\n");
 
@@ -893,6 +1182,8 @@ function renderDashboardTable(records, pagination = { offset: 0 }) {
       <th>Resume CV</th>
       <th>Company Name</th>
       <th>Job Title</th>
+      <th>Flag</th>
+      <th>Note</th>
       <th>Bid Time</th>
     </tr>
   </thead>
@@ -902,8 +1193,14 @@ function renderDashboardTable(records, pagination = { offset: 0 }) {
 
 function renderDashboardTablePanel(records, pagination) {
   return `<div class="dashboard-table-toolbar">
-    <div>${renderPaginationControls(pagination)}</div>
-    <button class="dashboard-refresh-button" type="button" data-refresh-table-url="${escapeHtml(tableUrl(pagination.page, pagination.pageSize))}" aria-label="Refresh bidding logs" title="Refresh bidding logs">
+    <div class="dashboard-table-tools">
+      <div class="record-filter" role="group" aria-label="Record filter">
+        <a class="record-filter-option${pagination.filter !== "flagged" ? " active" : ""}" href="${escapeHtml(pageUrl(1, pagination.pageSize, "all"))}">All records</a>
+        <a class="record-filter-option${pagination.filter === "flagged" ? " active" : ""}" href="${escapeHtml(pageUrl(1, pagination.pageSize, "flagged"))}">Flagged only</a>
+      </div>
+      <div>${renderPaginationControls(pagination)}</div>
+    </div>
+    <button class="dashboard-refresh-button" type="button" data-refresh-table-url="${escapeHtml(tableUrl(pagination.page, pagination.pageSize, pagination.filter))}" aria-label="Refresh bidding logs" title="Refresh bidding logs">
       <span aria-hidden="true">&#8635;</span>
     </button>
   </div>
@@ -951,7 +1248,13 @@ function layout({ title, master, active = "", body }) {
       line-height: 1;
     }
     nav .refresh-button { display: none; }
-    .dashboard-table-toolbar { display: flex; justify-content: space-between; gap: 14px; align-items: center; margin: 0 0 10px; }
+    .dashboard-table-toolbar { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; margin: 0 0 10px; }
+    .dashboard-table-tools { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+    .record-filter { display: inline-flex; padding: 3px; border: 1px solid #c8c8dd; border-radius: 9px; background: #fff; }
+    .record-filter-option { border-radius: 6px; color: #4d4d5d; padding: 6px 10px; text-decoration: none; font-size: 13px; font-weight: 700; }
+    .record-filter-option:hover { background: #f6f6ff; }
+    .record-filter-option.active { background: #171721; color: #fff; }
+    .dashboard-action-error { margin: 0 0 10px; }
     .dashboard-refresh-button {
       display: inline-flex;
       align-items: center;
@@ -994,6 +1297,22 @@ function layout({ title, master, active = "", body }) {
     .toggle { border: 1px solid #c8c8dd; border-radius: 6px; background: #fff; padding: 5px 9px; cursor: pointer; }
     .toggle:hover { background: #f6f6ff; }
     .expand-icon { width: 30px; height: 30px; padding: 0; border-radius: 999px; font-size: 14px; line-height: 1; }
+    .note-edit-button { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 1px solid #c8c8dd; border-radius: 8px; background: #fff; color: #3f3f52; padding: 0; font-size: 17px; cursor: pointer; }
+    .note-edit-button:hover { background: #f6f6ff; }
+    .note-edit-button.has-note::after { content: ""; position: absolute; top: 4px; right: 4px; width: 7px; height: 7px; border: 2px solid #fff; border-radius: 999px; background: #2563eb; }
+    .note-dialog { width: min(520px, calc(100vw - 40px)); border: 0; border-radius: 12px; padding: 0; box-shadow: 0 20px 50px rgba(0,0,0,0.28); }
+    .note-dialog::backdrop { background: rgba(17,24,39,0.48); }
+    .note-form { padding: 22px; }
+    .note-form h2 { margin: 0 0 8px; }
+    .note-form textarea { box-sizing: border-box; width: 100%; min-height: 160px; resize: vertical; border: 1px solid #c8c8dd; border-radius: 8px; padding: 10px 12px; font: inherit; }
+    .note-form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+    .note-form-actions button { border: 1px solid #c8c8dd; border-radius: 8px; background: #fff; color: #171721; padding: 9px 14px; cursor: pointer; }
+    .note-form-actions .note-save-button { border-color: #171721; background: #171721; color: #fff; }
+    .note-form-actions button:disabled { cursor: wait; opacity: 0.65; }
+    .flag-toggle-button { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 1px solid #c8c8dd; border-radius: 8px; background: #fff; color: #8a8a99; padding: 0; font-size: 18px; cursor: pointer; }
+    .flag-toggle-button:hover { background: #fff8e1; color: #a16207; }
+    .flag-toggle-button.is-flagged { border-color: #f2c94c; background: #fff4c2; color: #a16207; }
+    .flag-toggle-button:disabled { cursor: wait; opacity: 0.6; }
     .platform-badge { display: inline-flex; align-items: center; gap: 7px; border-radius: 999px; padding: 4px 9px 4px 5px; font-weight: 600; white-space: nowrap; }
     .platform-icon { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 999px; font-size: 13px; font-weight: 800; background: rgba(255,255,255,0.75); }
     .platform-help { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 17px; height: 17px; margin-left: 5px; border-radius: 999px; background: #fff; border: 1px solid #b8b8cf; color: #3f3f52; font-size: 12px; font-weight: 800; line-height: 1; cursor: help; vertical-align: middle; }
@@ -1039,6 +1358,70 @@ function layout({ title, master, active = "", body }) {
   ${body}
   <script>
     document.addEventListener("click", (event) => {
+      const flagButton = event.target.closest(".flag-toggle-button");
+      if (flagButton) {
+        const recordId = flagButton.dataset.recordId || "";
+        const currentlyFlagged = flagButton.getAttribute("aria-pressed") === "true";
+        const flagged = !currentlyFlagged;
+        const actionError = document.getElementById("dashboard-action-error");
+        if (!recordId) return;
+
+        if (actionError) actionError.textContent = "";
+        flagButton.disabled = true;
+        fetch("/api/bidding-logs/" + encodeURIComponent(recordId) + "/flag", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ flagged })
+        })
+          .then(async (response) => {
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(result.error || "Could not update flag.");
+            return result;
+          })
+          .then((result) => {
+            const isFlagged = Boolean(result.flagged);
+            const label = isFlagged ? "Remove review flag" : "Flag for review";
+            flagButton.classList.toggle("is-flagged", isFlagged);
+            flagButton.setAttribute("aria-pressed", String(isFlagged));
+            flagButton.setAttribute("aria-label", label);
+            flagButton.title = label;
+
+            const filter = new URLSearchParams(window.location.search).get("filter");
+            if (filter === "flagged" && !isFlagged) {
+              document.querySelector(".dashboard-refresh-button")?.click();
+            }
+          })
+          .catch((error) => {
+            if (actionError) actionError.textContent = error.message || "Could not update flag.";
+          })
+          .finally(() => {
+            flagButton.disabled = false;
+          });
+        return;
+      }
+
+      const noteButton = event.target.closest(".note-edit-button");
+      if (noteButton) {
+        const noteDialog = document.getElementById("note-dialog");
+        const noteRecordId = document.getElementById("note-record-id");
+        const noteText = document.getElementById("note-text");
+        const noteError = document.getElementById("note-error");
+        if (!noteDialog || !noteRecordId || !noteText) return;
+        noteRecordId.value = noteButton.dataset.recordId || "";
+        noteText.value = noteButton.dataset.note || "";
+        if (noteError) noteError.textContent = "";
+        noteDialog.showModal();
+        noteText.focus();
+        return;
+      }
+
+      const noteCancelButton = event.target.closest("#note-cancel-button");
+      if (noteCancelButton) {
+        document.getElementById("note-dialog")?.close();
+        return;
+      }
+
       const refreshButton = event.target.closest(".dashboard-refresh-button");
       if (refreshButton) {
         const tableContainer = document.getElementById("dashboard-table-container");
@@ -1084,6 +1467,43 @@ function layout({ title, master, active = "", body }) {
       button.setAttribute("title", isHidden ? "Collapse row" : "Expand row");
       button.innerHTML = isHidden ? "&#9662;" : "&#9656;";
     });
+
+    const noteForm = document.getElementById("note-form");
+    if (noteForm) {
+      noteForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const recordId = document.getElementById("note-record-id").value;
+        const noteText = document.getElementById("note-text");
+        const noteError = document.getElementById("note-error");
+        const saveButton = noteForm.querySelector(".note-save-button");
+        if (!recordId || !noteText || !saveButton) return;
+
+        noteError.textContent = "";
+        saveButton.disabled = true;
+        try {
+          const response = await fetch("/api/bidding-logs/" + encodeURIComponent(recordId) + "/note", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            credentials: "same-origin",
+            body: JSON.stringify({ note: noteText.value })
+          });
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(result.error || "Could not save note.");
+
+          const noteButton = document.querySelector('.note-edit-button[data-record-id="' + CSS.escape(recordId) + '"]');
+          if (noteButton) {
+            noteButton.dataset.note = result.note || "";
+            noteButton.classList.toggle("has-note", Boolean(result.note));
+            noteButton.title = result.note ? "Edit note (note saved)" : "Add note";
+          }
+          document.getElementById("note-dialog").close();
+        } catch (error) {
+          noteError.textContent = error.message || "Could not save note.";
+        } finally {
+          saveButton.disabled = false;
+        }
+      });
+    }
   </script>
 </body>
 </html>`;
@@ -1123,12 +1543,41 @@ async function requireMaster(request, response, next) {
   }
 }
 
+async function requireMasterApi(request, response, next) {
+  const masterId = masterIdFromRequest(request);
+  try {
+    const master = masterId ? await masterByMasterId(masterId) : null;
+    if (!master) {
+      response.status(401).json({ ok: false, error: "Sign in again to update this record." });
+      return;
+    }
+    request.master = master;
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
 function renderDashboardPage({ master = null, records, pagination }) {
   return layout({
     title: "Dashboard",
     master,
     active: "dashboard",
-    body: `<div id="dashboard-table-container">${renderDashboardTablePanel(records, pagination)}</div>`
+    body: `<div id="dashboard-action-error" class="error dashboard-action-error" role="alert"></div>
+      <div id="dashboard-table-container">${renderDashboardTablePanel(records, pagination)}</div>
+      <dialog id="note-dialog" class="note-dialog">
+        <form id="note-form" class="note-form">
+          <h2>Edit note</h2>
+          <input id="note-record-id" type="hidden">
+          <label for="note-text">Note</label>
+          <textarea id="note-text" maxlength="5000" placeholder="Add a note for this bidder record"></textarea>
+          <div id="note-error" class="error" role="alert"></div>
+          <div class="note-form-actions">
+            <button id="note-cancel-button" type="button">Cancel</button>
+            <button class="note-save-button" type="submit">Save</button>
+          </div>
+        </form>
+      </dialog>`
   });
 }
 
@@ -1220,8 +1669,8 @@ function createApp() {
   });
 
   app.get("/dashboard", requireMaster, async (request, response) => {
-    const { page, pageSize } = paginationFromQuery(request.query);
-    const { records, pagination } = await logsPageForMaster(request.master.master_id, { page, pageSize });
+    const { page, pageSize, filter } = paginationFromQuery(request.query);
+    const { records, pagination } = await logsPageForMaster(request.master.master_id, { page, pageSize, filter });
     response.type("html").send(renderDashboardPage({
       master: request.master,
       records,
@@ -1230,8 +1679,8 @@ function createApp() {
   });
 
   app.get("/dashboard/table", requireMaster, async (request, response) => {
-    const { page, pageSize } = paginationFromQuery(request.query);
-    const { records, pagination } = await logsPageForMaster(request.master.master_id, { page, pageSize });
+    const { page, pageSize, filter } = paginationFromQuery(request.query);
+    const { records, pagination } = await logsPageForMaster(request.master.master_id, { page, pageSize, filter });
     response.type("html").send(renderDashboardTablePanel(records, pagination));
   });
 
@@ -1265,6 +1714,50 @@ function createApp() {
     response.json({ ok: true, master_user_id: master.email });
   });
 
+  app.post("/api/bidding-logs/:id/note", requireMasterApi, async (request, response) => {
+    const recordId = Number(request.params.id);
+    const note = String(request.body.note ?? "").trim();
+
+    if (!Number.isInteger(recordId) || recordId <= 0) {
+      response.status(400).json({ ok: false, error: "Invalid bidder record ID." });
+      return;
+    }
+    if (note.length > 5000) {
+      response.status(400).json({ ok: false, error: "Note must be 5,000 characters or fewer." });
+      return;
+    }
+
+    const updated = await updateBiddingLogNote(request.master.master_id, recordId, note);
+    if (!updated) {
+      response.status(404).json({ ok: false, error: "Bidder record not found." });
+      return;
+    }
+
+    response.json({ ok: true, note });
+  });
+
+  app.post("/api/bidding-logs/:id/flag", requireMasterApi, async (request, response) => {
+    const recordId = Number(request.params.id);
+    const flagged = request.body.flagged;
+
+    if (!Number.isInteger(recordId) || recordId <= 0) {
+      response.status(400).json({ ok: false, error: "Invalid bidder record ID." });
+      return;
+    }
+    if (typeof flagged !== "boolean") {
+      response.status(400).json({ ok: false, error: "Expected flagged to be true or false." });
+      return;
+    }
+
+    const result = await updateBiddingLogFlag(request.master.master_id, recordId, flagged);
+    if (!result.updated) {
+      response.status(404).json({ ok: false, error: "Bidder record not found." });
+      return;
+    }
+
+    response.json({ ok: true, flagged, flagged_at: result.flaggedAt });
+  });
+
   app.post("/api/bidding-logs", async (request, response) => {
     const master = await verifyBidderCredentials(request.body.master_user_id, request.body.bidder_password);
     if (!master) {
@@ -1287,7 +1780,20 @@ function createApp() {
 
 async function startServer() {
   await initDatabase();
+
+  if (process.argv.includes("--migrate-dedupe")) {
+    await migrateBiddingLogDedupeKeys();
+    if (dbKind === "postgres") {
+      await db.end();
+    } else {
+      db.close();
+    }
+    return;
+  }
+
+  console.log("Database startup: ensuring default dashboard account...");
   await ensureDefaultAdmin();
+  console.log("Database startup: dashboard account ready.");
 
   createApp().listen(PORT, HOST, () => {
     console.log(`Bidding logs dashboard: http://${HOST}:${PORT}`);

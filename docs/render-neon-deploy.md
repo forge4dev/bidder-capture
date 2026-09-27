@@ -40,6 +40,19 @@ DATABASE_SSL=false
 
 Do not set `DATABASE_SSL=false` for Neon.
 
+## One-time duplicate cleanup
+
+Duplicate consolidation is separate from normal server startup so historical cleanup cannot delay the dashboard from accepting requests.
+
+Run this once for each database after deploying a version that includes the deduplication migration:
+
+```powershell
+$env:DATABASE_URL="postgresql://..."
+npm.cmd run migrate:dedupe
+```
+
+The migration reads records in batches, removes older duplicate submissions, preserves the newest record and any saved note, and records completion in `schema_migrations`. Running the command again safely reports that it has already completed.
+
 ## First login
 
 The server creates this default user on startup:

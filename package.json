@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server/index.js",
     "server": "node server/index.js",
+    "migrate:dedupe": "node server/index.js --migrate-dedupe",
     "check": "node --check server/index.js && node --check extension/background.js && node --check extension/content.js && node --check extension/options.js && node --check extension/page-hook.js && node --check extension/popup.js"
   },
   "dependencies": {
